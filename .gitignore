@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# AIRIS runtime output (see airis/config.py)
+img_saves/
+downlink_queue/
+moves.csv
+candidates.csv
+
+# Editors
+.vscode/
+.idea/

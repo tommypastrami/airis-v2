@@ -27,9 +27,29 @@ def test_leading_garble_is_detected():
 
 def test_bad_checksum_field():
     with pytest.raises(ProtocolError):
-        parse_host_line("MOVE 1 2 #3*ZZ")
+        parse_host_line("MOVE 1 2 #3*ZZZZ")
+    with pytest.raises(ProtocolError):
+        parse_host_line("MOVE 1 2 #3*4A")           # the old two-digit XOR trailer
     with pytest.raises(ProtocolError):
         parse_host_line("MOVE 1 2")
+
+
+def test_checksum_is_crc16_ccitt_false():
+    """The firmware's crc16() must produce the same values."""
+    assert protocol.checksum("123456789") == 0x29B1
+    assert encode("POS", 7) == b"POS #7*7735\n"
+
+
+def test_dropped_identical_pair_is_detected():
+    """The XOR checksum let MOVE 100.000 become MOVE 1.000: two identical bytes cancel."""
+    good = encode("MOVE 100.000 0.000", 5).decode()
+    with pytest.raises(ProtocolError):
+        parse_host_line(good.replace("100.000", "1.000", 1))
+
+
+def test_done_without_residuals_is_not_a_done():
+    assert parse_fw_line("DONE").kind == "OTHER"
+    assert parse_fw_line("DONE 0.1").kind == "OTHER"
 
 
 def test_seq_range():
@@ -47,7 +67,7 @@ def test_seq_range():
     ("POS 59.87 0.12", "POS", None),
     ("ZERO SET", "ZERO", None),
     ("SUN OK -12.000 140.000", "SUN", None),
-    ("RX: MOVE 1 2 #3*4A", "RX", None),
+    ("RX: MOVE 1 2 #3*4A2B", "RX", None),
     ("HOLD TIMEOUT: drivers released", "OTHER", None),
     ("STATUS x", "OTHER", None),
 ])

@@ -1,13 +1,4 @@
-"""Trimble BX992 NMEA assembly, ADAPT fallback, and the observer position.
-
-Keeps three things and nothing else: the latest trustworthy fix (GGA), the
-latest heading (HDT) and the UTC date (RMC/ZDA). Everything is parsed here with
-explicit types, so a quality field that arrives as the string "4" is still a 4.
-
-Authority: the Trimble is authoritative for position while its fix is younger
-than TRIMBLE_STALE_S; otherwise the latest ADAPT navigation update is used;
-before either, the configured defaults. ADAPT always owns flight_phase.
-"""
+"""Trimble BX992 NMEA assembly, ADAPT fallback, and the observer position."""
 from __future__ import annotations
 
 import logging
@@ -32,7 +23,7 @@ def nmea_checksum_ok(sentence: str) -> bool:
         return False
     body, _, cs = sentence[1:].partition("*")
     if not cs:
-        return True  # some receivers omit it; accept
+        return False  # the Trimble always sends one; without it a truncated datagram would pass
     x = 0
     for b in body.encode("ascii", "ignore"):
         x ^= b
@@ -160,6 +151,9 @@ class NavState:
                 utc = None
                 if self.utc_date and f["tod"]:
                     utc = datetime.combine(self.utc_date, f["tod"]).replace(tzinfo=timezone.utc)
+                    prev = self.fix.utc if self.fix is not None else None
+                    if prev is not None and utc < prev - timedelta(hours=12):
+                        utc += timedelta(days=1)   # just past midnight: the date sentence has not caught up yet
                 self.fix = Fix(f["lat"], f["lon"], alt + (f["geoid_sep_m"] or 0.0),
                                f["quality"], f["num_sats"], utc, now)
             self._maybe_push()
@@ -182,6 +176,14 @@ class NavState:
         if adapt is not None and not (adapt.lat == 0.0 and adapt.lon == 0.0):
             return Site(adapt.lat, adapt.lon, adapt.alt_m), Code.NAV_STALE_USING_ADAPT
         return Site(), Code.NAV_USING_DEFAULTS
+
+    def gps_utc(self) -> Optional[datetime]:
+        """Current UTC from the last fresh GPS fix (fix time + time elapsed since), or None."""
+        with self._lock:
+            fix, now = self.fix, self._clock()
+        if fix is None or fix.utc is None or now - fix.t_mono > config.TRIMBLE_STALE_S:
+            return None
+        return fix.utc + timedelta(seconds=now - fix.t_mono)
 
     def heading_deg(self) -> Optional[float]:
         with self._lock:
@@ -219,9 +221,12 @@ def run_udp_listener(state: NavState, port: int = config.TRIMBLE_UDP_PORT, host:
                 except socket.timeout:
                     continue
                 for line in data.decode("ascii", "replace").splitlines():
-                    s = parse_sentence(line)
-                    if s is not None:
-                        state.handle(s)
+                    try:
+                        s = parse_sentence(line)
+                        if s is not None:
+                            state.handle(s)
+                    except Exception:                    # one bad sentence must not end the nav thread
+                        log.exception("%s could not handle %r", Code.NAV_BAD_SENTENCE.value, line[:80])
         except OSError as e:
             log.warning("%s listener socket error: %s; rebinding", Code.NAV_BAD_SENTENCE.value, e)
             time.sleep(2.0)

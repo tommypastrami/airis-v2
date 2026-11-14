@@ -19,7 +19,6 @@ def fast_link(monkeypatch):
     """Shorten bridge timeouts so a test suite runs in seconds (sim runs at 25x)."""
     monkeypatch.setattr(config, "ACK_TIMEOUT_S", 0.3)
     monkeypatch.setattr(config, "MOVE_START_TIMEOUT_S", 1.0)
-    monkeypatch.setattr(config, "MOVE_MARGIN_S", 1.0)
     monkeypatch.setattr(config, "MOVE_MAX_S", 3.0)
     monkeypatch.setattr(config, "CAL_START_TIMEOUT_S", 1.0)
     monkeypatch.setattr(config, "CAL_FINISH_TIMEOUT_S", 5.0)
@@ -29,8 +28,11 @@ def fast_link(monkeypatch):
 
 
 def make_bridge(tmp_path, faults=None, mount=None, **kw):
+    # require_sun defaults off here: these tests exercise CAL and MOVE without first
+    # pushing a sun center (test_calibration_waits_for_a_sun_push covers the gate).
+    require_sun = kw.pop("require_sun", False)
     host_sock, fa = make_pair(faults=faults, mount=mount, **kw)
-    bridge = Bridge(SocketTransport(host_sock), moves_csv=str(tmp_path / "moves.csv"))
+    bridge = Bridge(SocketTransport(host_sock), moves_csv=str(tmp_path / "moves.csv"), require_sun=require_sun)
     return bridge, fa
 
 

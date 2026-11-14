@@ -1,0 +1,11 @@
+# Flight and test dependencies of airis-v2. Versions are not pinned here:
+# pin them to what is installed on the flight Jetson once that is frozen.
+numpy
+scipy
+astropy
+healpy
+pyserial
+Pillow
+protobuf        # plus the generated ADAPT bindings on PYTHONPATH (see README)
+spidev          # Jetson only: MAX31865 RTD
+pytest          # tests only

@@ -1,17 +1,15 @@
-"""Byte transports for the bridge: a real serial port, or a socket to a simulator.
-
-Both expose ``readline(timeout) -> bytes | None``, ``write(bytes)``, ``reopen()``.
-SerialTransport sets ``dtr = False`` BEFORE ``open()`` so a re-open does not
-reset the Mega (pyserial asserts DTR on open otherwise, whatever ``dsrdtr`` says).
-"""
+"""Byte transports for the bridge: a real serial port, or a socket to a simulator."""
 from __future__ import annotations
 
 import select
 import socket
 import time
+import logging
 from typing import Optional
 
 from . import config
+
+log = logging.getLogger("airis.transport")
 
 
 class SocketTransport:
@@ -67,7 +65,9 @@ class SerialTransport:  # pragma: no cover - hardware
         self.ser = None
         self.port = None
         self.reopen_count = 0
-        self.reopen()
+        self._buf = b""
+        if not self.reopen():
+            log.error("no serial port could be opened (tried %s)", ", ".join(candidates))
 
     def reopen(self) -> bool:
         if self.ser is not None:
@@ -76,10 +76,12 @@ class SerialTransport:  # pragma: no cover - hardware
             except Exception:
                 pass
             self.ser = None
+        self._buf = b""
         for port in self.candidates:
             try:
                 ser = self._serial.Serial()
                 ser.port, ser.baudrate, ser.timeout = port, self.baud, 0.1
+                ser.write_timeout = 1.0  # a stuck port raises instead of blocking the bridge forever
                 ser.dtr = False          # set BEFORE open: no auto-reset of the Mega
                 ser.rts = False
                 ser.exclusive = True
@@ -98,17 +100,18 @@ class SerialTransport:  # pragma: no cover - hardware
             time.sleep(min(timeout, 0.2))
             return None
         deadline = time.monotonic() + timeout
-        buf = b""
-        while time.monotonic() < deadline:
+        while b"\n" not in self._buf:
+            if time.monotonic() >= deadline:
+                return None                   # the partial line stays in self._buf
             try:
-                chunk = self.ser.readline()
+                chunk = self.ser.read(max(1, self.ser.in_waiting))   # blocks at most ser.timeout
             except Exception:
                 return None
-            if chunk:
-                buf += chunk
-                if buf.endswith(b"\n"):
-                    return buf
-        return buf if buf.endswith(b"\n") else None
+            self._buf += chunk
+            if len(self._buf) > 4096 and b"\n" not in self._buf:
+                self._buf = b""               # noise with no terminator: start clean
+        line, _, self._buf = self._buf.partition(b"\n")
+        return line + b"\n"
 
     def write(self, data: bytes) -> None:
         if self.ser is None:

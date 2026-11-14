@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from . import config
-from .errors import Code, Fault
+from .errors import Code
 
 
 @dataclass
@@ -51,7 +51,7 @@ class MountClient:
             try:
                 return ClientResult(True, "OK", "", float(parts[1]), float(parts[2]), float(parts[3]))
             except (IndexError, ValueError):
-                return ClientResult(True, "OK")
+                return ClientResult(False, Code.LNK_UNEXPECTED.value, text)
         if parts[0] == "ok":
             return ClientResult(True, "OK")
         if parts[0] == "status":
@@ -65,7 +65,7 @@ class MountClient:
 
     def move(self, el: float, az: float) -> ClientResult:
         if not (config.ANGLE_MIN_DEG <= el <= config.ANGLE_MAX_DEG and config.ANGLE_MIN_DEG <= az <= config.ANGLE_MAX_DEG):
-            raise Fault(Code.PTG_RANGE, f"el={el:.2f} az={az:.2f}")
+            return ClientResult(False, Code.PTG_RANGE.value, f"el={el:.2f} az={az:.2f}")
         return self._request(f"move {el:.3f} {az:.3f}", wait_done=True)
 
     def calibrate(self) -> ClientResult:

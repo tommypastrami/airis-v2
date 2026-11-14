@@ -1,15 +1,10 @@
-"""Payload hardware: RTD thermometers, the heater policy, Jetson thermal zones, the watchdog.
-
-Everything hardware-facing takes an injectable reader/actuator so the policy is
-testable on a laptop. The heater policy is explicit about the one case v1 got
-backwards: an unreadable sensor temperature during ASCENT defaults the heater
-ON (duty-cycled), because the paper's ascent profile reaches -60 C and the
-sensor's floor is -25 C; at float it defaults OFF.
-"""
+"""Payload hardware: RTD thermometers, the heater policy, Jetson thermal zones, the watchdog."""
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -28,13 +23,16 @@ class HeaterDecision:
     reason: str
 
 
-def heater_policy(sensor_c: Optional[float], flight_phase: Optional[int], duty_tick: int = 0) -> HeaterDecision:
+def heater_policy(sensor_c: Optional[float], flight_phase: Optional[int], duty_tick: int = 0,
+                  was_on: bool = False) -> HeaterDecision:
     if sensor_c is None:
         if flight_phase == PHASE_ASCENT:
             return HeaterDecision(duty_tick % 2 == 0, "RTD unreadable during ascent: 50% duty")
         return HeaterDecision(False, "RTD unreadable: heater off")
     if sensor_c < config.SENSOR_HEAT_ON_C:
         return HeaterDecision(True, f"sensor {sensor_c:.1f} C below {config.SENSOR_HEAT_ON_C} C")
+    if was_on and sensor_c < config.SENSOR_HEAT_OFF_C:     # hysteresis: no relay chatter at the threshold
+        return HeaterDecision(True, f"sensor {sensor_c:.1f} C, holding on until {config.SENSOR_HEAT_OFF_C} C")
     return HeaterDecision(False, f"sensor {sensor_c:.1f} C ok")
 
 
@@ -56,6 +54,9 @@ class MAX31865:  # pragma: no cover - hardware
         d = self.spi.xfer2([0x01, 0, 0])[1:]
         raw = ((d[0] << 8) | d[1]) >> 1
         if d[1] & 1:
+            # The fault latches in the chip until it is cleared (config bit 1);
+            # left latched, every later read would fail too.
+            self.spi.xfer2([0x80, self._CFG_RUN | 0b10])
             raise RuntimeError("MAX31865 fault")
         r = raw / 32768.0 * self.ref_ohm
         return (r / self.r0 - 1.0) / 0.00385
@@ -64,6 +65,12 @@ class MAX31865:  # pragma: no cover - hardware
 def read_jetson_zones_c(root: str = "/sys/devices/virtual/thermal") -> dict[str, float]:
     out = {}
     for p in Path(root).glob("thermal_zone*/temp"):
+        try:
+            # Some Jetson models expose a PMIC zone fixed at 100 C; it is not a measurement.
+            if "pmic" in (p.parent / "type").read_text().lower():
+                continue
+        except OSError:
+            pass
         try:
             out[p.parent.name] = int(p.read_text().strip()) / 1000.0
         except (OSError, ValueError):
@@ -94,7 +101,8 @@ class ThermalWatchdog:
         self.read_zones, self.read_rtd, self.read_camera = read_zones, read_rtd, read_camera
         self.set_heater, self.shutdown, self.flight_phase, self.limit_c = set_heater, shutdown, flight_phase, limit_c
         self.ticks = 0
-        self.history: list[ThermalSample] = []
+        self.heater_on = False
+        self.history: "deque[ThermalSample]" = deque(maxlen=4320)   # one day at the default period
 
     def tick(self) -> ThermalSample:
         self.ticks += 1
@@ -105,8 +113,13 @@ class ThermalWatchdog:
         except Exception as e:
             log.error("RTD read failed: %s", e)
             sensor_c, obc_c = None, None
-        cam = self.read_camera()
-        d = heater_policy(sensor_c, self.flight_phase(), self.ticks)
+        try:
+            cam = self.read_camera()
+        except Exception as e:
+            log.error("camera temperature read failed: %s", e)
+            cam = None
+        d = heater_policy(sensor_c, self.flight_phase(), self.ticks, self.heater_on)
+        self.heater_on = d.on
         self.set_heater(d.on)
         s = ThermalSample(peak, sensor_c, obc_c, cam, d.on, d.reason)
         self.history.append(s)
@@ -114,3 +127,12 @@ class ThermalWatchdog:
             log.critical("%s Jetson %.1f C >= %.1f C: shutting down", Code.CAM_OVERHEAT.value, peak, self.limit_c)
             self.shutdown()
         return s
+
+    def run(self, stop: threading.Event, period_s: float = config.THERMAL_POLL_S) -> None:
+        """Tick forever; a failed tick is logged and the next one still runs."""
+        while not stop.is_set():
+            try:
+                self.tick()
+            except Exception:
+                log.exception("thermal watchdog tick failed")
+            stop.wait(period_s)

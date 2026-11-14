@@ -1,20 +1,4 @@
-"""One error scheme for the whole stack.
-
-A failure is a code with a subsystem prefix, a short name, a human message and
-optional data. It prints as ``MNT-63 BUSY: mount is executing a move (seq=17)``
-and the code is the first token on every log line and CSV row that carries it,
-so a grep for the code finds every occurrence across every file.
-
-Prefix  Owner
-LNK     airis_bridge (the serial link)
-MNT     firmware codes, mirrored one-to-one
-PTG     pointing
-NAV     nav
-DET     detect
-DLK     downlink
-CAM     camera module
-SCH     scheduler
-"""
+"""One error scheme for the whole stack."""
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -76,11 +60,14 @@ class Code(str, Enum):
 FIRMWARE_CODE_TO_ERR = {int(c.value.split("-")[1]): c for c in Code if c.value.startswith("MNT-")}
 
 
-@dataclass
+@dataclass(eq=False)        # eq=False keeps exceptions hashable (identity), as Python expects
 class Fault(Exception):
     code: Code
     msg: str = ""
     data: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        super().__init__(self.code, self.msg, self.data)   # fill .args so pickling and logging work
 
     def __str__(self) -> str:
         extra = " ".join(f"{k}={v}" for k, v in self.data.items())

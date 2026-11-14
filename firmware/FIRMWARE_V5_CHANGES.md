@@ -1,16 +1,25 @@
-# Firmware v5 changes (motorsworking_715.ino v4.4 -> v5.0)
+# Firmware v5 changes (motorsworking_715.ino v4.4 -> v5.0 -> v5.1)
 
-Six changes, all in the serial/command layer and the settle logic. The motion
-profile, homing, snag ladder and sun geometry are untouched. The fake Arduino in
-`sim/fake_arduino.py` implements exactly this behaviour, and `tests/test_bridge.py`
-is the acceptance test for the real board: run the bridge against the Mega with
-`python -m airis.airis_bridge` and the same requests must produce the same replies.
+Sections 1-6 describe v5.0: six changes in the serial/command layer and the settle
+logic. **Section 7 lists the v5.1 changes, which supersede parts of sections 1, 2
+and 4** (marked where they do). `motorsworking_v5.ino` is the v5.1 source.
+
+The .ino also contains behaviour that was never listed here and predates v5.0:
+STOP releases the drivers, the 30-minute hold, the -140..+180 azimuth range with
+the mandatory elevation flip below -140, MOVE running on the DANCE speed profile
+(50 dps, 45 dps2), and the autonomous "educated re-cal" (now disabled, section 7).
+
+The fake Arduino in `sim/fake_arduino.py` models the protocol only. It does NOT
+model sun routing, the azimuth range, fault latching, STOP releasing the drivers
+or the real move timing, so passing `tests/test_bridge.py` is not proof that the
+board behaves. The acceptance run at the end of this file is.
 
 Line numbers refer to v4.4 as uploaded 2026-10-17.
 
 ## 1. Sequence number + checksum, ACK/NAK, de-duplication (replaces the sync bytes and the echo check)
 
-Every host line is `<CMD> [args] #<seq>*<cs>`; `cs` = XOR of every byte before `*`, two hex digits.
+Every host line is `<CMD> [args] #<seq>*<cs>`; `cs` = XOR of every byte before `*`, two hex digits
+(**v5.1: CRC-16, four hex digits — section 7**; the code below is the v5.0 text).
 A line that fails the check is answered `NAK <seq> <reason>` and never executed. A line whose
 `seq` and text equal the last executed one is answered `ACK <seq>` and not executed again.
 
@@ -104,7 +113,7 @@ Mechanical replacement of every `pushErrMsg(PY_ERR_GENERAL, ...)` whose text is 
 | `not homed (send CAL)`                           | 2228, 2383, 2420                    | `PY_ERR_NOT_HOMED` 64 |
 | `fault latched (send ACK)`                       | 2213, 2318, 2378, 2414              | `PY_ERR_FAULT` 65 |
 | `line too long`                                  | 2460                                | `PY_ERR_LINE_LONG` 66 |
-| `RESET: controller (re)booted ...`               | 2523                                | `PY_ERR_RESET` 67 |
+| `RESET: controller (re)booted ...`               | 2523                                | `PY_ERR_RESET` 67 (v5.0 never actually sent it; v5.1 does, section 7) |
 | `position outside +/-180 - send CAL first`       | 2236                                | `PY_ERR_NOT_HOMED` 64 |
 
 `PY_ERR_GENERAL` 50 stays for anything genuinely general. The host maps every code
@@ -147,6 +156,10 @@ also turn the snag watch ON for pointing legs in `startSlewTo()` (`watch=true` i
 
 ## 4. Live sun center
 
+**Superseded by v5.1 (section 7): SUN is taken in the physical-home frame and stored
+as given.** The v5.0 text below subtracted the frame offsets, which was wrong for
+every push that arrived before SETZERO.
+
 Line 670-671: `const float sunEl = ...; const float sunAz = ...;` -> `float sunEl = ...; float sunAz = ...;`.
 Replace the `SUN <el> <az>` ignore branch (lines 2403-2412) with:
 
@@ -177,8 +190,43 @@ to 0 in BOTH the firmware and `airis/config.py` and re-measure `SUN_CENTER_*`.
 `DANCE`, `MOTOROFF`, `POS`, `CALQ`, `HOME_LOG`, `TGT` stay. Drop `POS_STREAM_MS` to 200 ms
 (5 Hz) to lighten the link; the bridge never reads the stream.
 
+## 7. v5.1 changes
+
+The host (`airis/`) was changed in step; flash and deploy together.
+
+1. **Checksum is CRC-16/CCITT-FALSE, four hex digits** (`crc16()`, poly 0x1021, init
+   0xFFFF; `"123456789"` gives `29B1`, `POS #7` gives `7735`). The one-byte XOR accepted
+   `MOVE 1.000` for `MOVE 100.000` (two identical dropped bytes cancel). A v5.0 host
+   or firmware on either side now gets `NAK` for every line.
+2. **`SUN <el> <az>` is in the physical-home frame, always**, and is stored as given.
+   Out-of-range or NaN values are refused with `ERR 61` and the keep-out is unchanged
+   (a NaN center made every box test false: no keep-out).
+3. **`ERR 67 RESET: ...` is sent once from `setup()`.** The host treats it as "not
+   homed, sun center back at the compile-time default" and will not send CAL until
+   it has pushed SUN again.
+4. **The educated re-cal is off (`MOVES_PER_RECAL 0`).** After the host's SETZERO the
+   index is at -HOME_*_OFFSET, not (0, 0), so the sweep around home always missed,
+   fell back to a full homing and left the encoders in the index frame while the
+   host kept commanding in the physical frame.
+5. **A sun-detour leg must arrive before the next one starts** (`SUN_WP_TOL_DEG`, 3 deg;
+   bench-tune it). A stalled or short leg aborts the move with
+   `ERR 58 settle <el_err> <az_err> sun-detour waypoint not reached`. The snag watch
+   now stays on for every detour leg.
+6. **After `ERR 58` the active hold is anchored where the mount is**, not left on the
+   unreached target (it used to re-trim toward it every 500 ms, unwatched).
+7. **SETZERO is safe to repeat**: when the frame is already physical it answers
+   `ZERO SET` without shifting again. It also shifts the index re-zero reference, so
+   the continuous index re-zero works after SETZERO. That drift control had never
+   run with non-zero home offsets; watch for `IDX ... re-zeroed` lines on the bench.
+8. **`BENCH_COMMANDS`** (default 1) gates `RAW` and bare `SUN` (slew straight at the
+   sun, keep-out bypassed). **Set it to 0 for the flight build**; both then answer `ERR 60`.
+
+Not changed, and still open: `HOME_SPEED_DPS` is 200 while the comments say AZ lost
+sync at 135; STOP still releases the drivers; the sun box is a fixed el/az rectangle.
+
 ## Acceptance
 
 With the Mega flashed and `python -m airis.airis_bridge --socket /tmp/b.sock` running,
-`python -m tools.bridge_smoke /tmp/b.sock` must print `cal ok`, `move ok el_err az_err dt`,
-`busy MNT-63`, `sun ok`, in that order.
+`python -m tools.bridge_smoke /tmp/b.sock` must print `sun ok`, `cal ok`,
+`move ok el_err az_err dt`, `busy MNT-63`, in that order. The bridge refuses to home
+(`MNT-59`) until a sun position has been pushed.

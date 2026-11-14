@@ -1,7 +1,4 @@
-"""Bridge + fake Arduino + mount sim: the regression suite for Goal 1.
-
-Each test states the v4 failure it guards against.
-"""
+"""Bridge + fake Arduino + mount sim: the regression suite for Goal 1."""
 import csv
 import os
 import socket
@@ -84,8 +81,7 @@ def test_clean_move_reports_residual_and_logs_csv(bridge_and_fw, tmp_path):
 
 
 def test_garbled_first_send_executes_exactly_one_move(tmp_path, fast_link):
-    """v4 bug #4: a garbled first attempt produced a false failure AND a ghost move.
-    v5: the firmware NAKs the damaged line, the resend executes, the host sees ok."""
+    """v4 bug #4: a garbled first attempt produced a false failure AND a ghost move."""
     faults = Faults(garble_after_idle_s=2.0, garble_bytes=3)
     bridge, fa = make_bridge(tmp_path, faults=faults)
     try:
@@ -164,8 +160,7 @@ def test_reset_is_detected_and_recovered(tmp_path, fast_link):
 
 
 def test_stall_is_reported_as_settle_fail_without_touching_az(tmp_path, fast_link):
-    """v4: an EL stall nudged AZ +/-10 deg, unbounded, then the bridge detoured 40 deg.
-    v5: bounded settle, ERR 58 with the residual, AZ untouched."""
+    """v4: an EL stall nudged AZ +/-10 deg, unbounded, then the bridge detoured 40 deg."""
     mount = MountSim.at_boot()
     bridge, fa = make_bridge(tmp_path, mount=mount)
     try:
@@ -187,12 +182,35 @@ def test_timeout_sends_stop(tmp_path, fast_link, monkeypatch):
     try:
         assert bridge.calibrate().ok
         monkeypatch.setattr(config, "MOVE_MAX_S", 0.05)
-        monkeypatch.setattr(config, "MOVE_MARGIN_S", 0.0)
         r = bridge.move(150.0, 150.0)
         assert not r.ok and r.code == Code.MNT_STOPPED.value
         assert any(l.startswith("RX: STOP") for l in fa.log)
     finally:
         bridge.close(); fa.shutdown()
+
+
+def test_calibration_waits_for_a_sun_push(tmp_path, fast_link):
+    """The bridge will not home until a sun position has been pushed since the firmware booted."""
+    bridge, fa = make_bridge(tmp_path, require_sun=True)
+    try:
+        r = bridge.calibrate()
+        assert not r.ok and r.code == Code.MNT_SUN_UNKNOWN.value
+        assert not any(l.startswith("RX: CAL") for l in fa.log)
+        assert bridge.set_sun(-40.0, 120.0)
+        assert bridge.calibrate().ok
+        fa.reset()                                # a reboot forgets the sun center
+        assert _wait(lambda: not bridge.sun_ok, 2.0)
+        assert bridge.move(10.0, 10.0).code == Code.MNT_SUN_UNKNOWN.value
+    finally:
+        bridge.close(); fa.shutdown()
+
+
+def test_sun_push_rejects_non_finite_values(bridge_and_fw):
+    """A NaN center would switch the firmware's keep-out off; it must never be sent."""
+    bridge, fa = bridge_and_fw
+    assert not bridge.set_sun(float("nan"), 10.0)
+    assert not bridge.set_sun(10.0, float("inf"))
+    assert not any(l.startswith("RX: SUN") for l in fa.log)
 
 
 def test_sun_keepout_refusal_is_a_named_code(bridge_and_fw):
@@ -256,3 +274,51 @@ def test_request_server_and_client(tmp_path, fast_link):
         assert client.set_sun(10.0, 10.0).ok
     finally:
         bridge.close(); fa.shutdown()
+
+
+def test_latched_fault_is_cleared_with_ack_then_recalibrated(tmp_path, fast_link, monkeypatch):
+    """A latched fault is cleared with ACK and re-calibrated; automatic clears are rate-limited."""
+    bridge, fa = make_bridge(tmp_path)
+    try:
+        assert bridge.calibrate().ok
+        fa.state, fa.homed = "FAULT", False                       # what latchFault() leaves behind
+        r = bridge.move(20.0, 10.0)
+        assert r.ok and r.recalibrated, r
+        assert any(l.startswith("RX: ACK") for l in fa.log)
+        # the automatic clear is rate-limited so a real catch is not ground against forever
+        monkeypatch.setattr(config, "FAULT_AUTO_CLEAR_MAX", 1)
+        bridge._auto_clears, bridge._auto_clear_t0 = 1, bridge.clock()
+        fa.state, fa.homed = "FAULT", False
+        n_ack = sum(1 for l in fa.log if l.startswith("RX: ACK"))
+        assert bridge.move(20.0, 10.0).code == Code.MNT_FAULT_LATCHED.value
+        assert sum(1 for l in fa.log if l.startswith("RX: ACK")) == n_ack
+        assert bridge.calibrate().ok                              # an explicit request always clears it
+    finally:
+        bridge.close(); fa.shutdown()
+
+
+def test_unrelated_err_does_not_end_a_move(tmp_path, fast_link):
+    """ERR lines carry no seq. Line noise can provoke ERR 66 at any time; it is not the move's result."""
+    bridge, fa = make_bridge(tmp_path)
+    try:
+        assert bridge.calibrate().ok
+        out = {}
+        t = threading.Thread(target=lambda: out.setdefault("r", bridge.move(80.0, 40.0))); t.start()
+        time.sleep(0.05)
+        fa._err(66, "line too long")
+        t.join(10)
+        assert out["r"].ok, out["r"]
+    finally:
+        bridge.close(); fa.shutdown()
+
+
+def test_seq_does_not_restart_at_zero():
+    """A restarted bridge must not repeat the previous run's first seq (the firmware would drop the line)."""
+    import socket as _s
+    starts = set()
+    for _ in range(12):
+        a, b = _s.socketpair()
+        br = Bridge(SocketTransport(a), moves_csv=None)
+        starts.add(br._seq)
+        br.close(); b.close()
+    assert len(starts) > 1

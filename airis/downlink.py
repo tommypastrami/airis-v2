@@ -1,17 +1,4 @@
-"""Products sized for the link, chunked with a manifest, honoring FULL / SLOW / STOP.
-
-Products from one observation
-    table      candidates as JSON (a few KB)                      FULL, SLOW
-    thumbnail  1/THUMB_SCALE PNG of the frame (~150 KB)          FULL, SLOW
-    cutouts    CUTOUT_PX square 16-bit arrays around each         FULL
-               candidate with the WCS of the cutout
-    frame      the full binned frame stays on disk; on request only
-
-Every binary product is split into CHUNK_BYTES chunks; a manifest (name, size,
-sha256, chunk count) goes first so the ground can request a missing chunk by
-number. STOP mode queues everything to disk and flush() sends it when FULL
-returns. Nothing is ever silently dropped: a drop is a DLK-xx log line.
-"""
+"""Products sized for the link, chunked with a manifest, honoring FULL / SLOW / STOP."""
 from __future__ import annotations
 
 import hashlib
@@ -19,7 +6,9 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -71,12 +60,15 @@ def products_for(frame_data: np.ndarray, candidates: list, burst_id: int, tile: 
                  frame_utc: str, wcs_dict: Optional[dict] = None) -> list[Product]:
     table = {"burst_id": burst_id, "tile_ra": tile[0], "tile_dec": tile[1], "frame_utc": frame_utc,
              "wcs": wcs_dict or {}, "candidates": [c if isinstance(c, dict) else c.__dict__ for c in candidates]}
-    out = [Product(f"b{burst_id}_table.json", "table", json.dumps(table).encode("utf-8"))]
-    out.append(Product(f"b{burst_id}_thumb.png", "thumbnail", make_thumbnail(frame_data)))
+    # The frame time is part of every name: several frames of one burst must not
+    # overwrite each other in the queue or on the ground.
+    stem = f"b{burst_id}_{re.sub(r'[^0-9A-Za-z]', '', frame_utc)[:15]}"
+    out = [Product(f"{stem}_table.json", "table", json.dumps(table).encode("utf-8"))]
+    out.append(Product(f"{stem}_thumb.png", "thumbnail", make_thumbnail(frame_data)))
     for i, c in enumerate(table["candidates"]):
         data, meta = make_cutout(frame_data, c["x"], c["y"])
         meta.update({"candidate": i, "confidence": c.get("confidence")})
-        out.append(Product(f"b{burst_id}_cand{i}.u16", "cutout", data, meta))
+        out.append(Product(f"{stem}_cand{i}.u16", "cutout", data, meta))
     return out
 
 
@@ -102,12 +94,22 @@ class Downlink:
         self.sent: list[str] = []
         self.queued: list[str] = []
         self.dropped: list[str] = []
+        self._flush_lock = threading.Lock()
+        # Products queued while the link was down go out when it comes back,
+        # not only on a change of mode.
+        sender.on_attach = self.flush_async
 
     def set_mode(self, mode: str) -> None:
+        if mode not in (FULL, SLOW, STOP):
+            log.warning("unknown comms mode %r ignored; staying in %s", mode, self.mode)
+            return
         self.mode = mode
         log.info("comms mode %s", mode)
         if mode == FULL:
             self.flush()
+
+    def flush_async(self) -> None:
+        threading.Thread(target=self.flush, daemon=True, name="downlink-flush").start()
 
     def send_products(self, products: list[Product], burst_id: int) -> None:
         for p in products:
@@ -121,18 +123,24 @@ class Downlink:
                 continue
             self._send_now(p, burst_id)
 
-    def _send_now(self, p: Product, burst_id: int) -> bool:
+    def _send_now(self, p: Product, burst_id: int, requeue: bool = True) -> bool:
+        """Manifest, then chunks. On failure the product is queued to disk (unless it is already there)."""
         manifest, chunks = chunk(p)
-        if not self.sender.send(Envelope("internal_message", {"heading": "image_manifest", "message": json.dumps(manifest)})):
+        ok = self.sender.send(Envelope("event_notification", {
+            "event_type": "EVENT_UNSPECIFIED", "timestamp": time.time(),
+            "detail": "image_manifest " + json.dumps(manifest)}))
+        if ok:
+            for i, c in enumerate(chunks):
+                ok = self.sender.send(Envelope("image_data", {"timestamp": time.time(), "burst_id": burst_id,
+                                                               "sequence_num": i, "image_data": c}))
+                if not ok:
+                    log.warning("%s chunk %d of %s rejected", Code.DLK_CHUNK_REJECTED.value, i, p.name)
+                    break
+        if not ok:
             self.dropped.append(p.name)
+            if requeue:
+                self._queue(p)
             return False
-        for i, c in enumerate(chunks):
-            ok = self.sender.send(Envelope("image_data", {"burst_id": burst_id, "sequence_num": i, "image_data": c,
-                                                           "name": p.name}))
-            if not ok:
-                log.warning("%s chunk %d of %s rejected", Code.DLK_CHUNK_REJECTED.value, i, p.name)
-                self.dropped.append(p.name)
-                return False
         self.sent.append(p.name)
         return True
 
@@ -149,6 +157,14 @@ class Downlink:
     def flush(self) -> int:
         if not os.path.isdir(self.queue_dir) or self.mode != FULL or not self.sender.connected():
             return 0
+        if not self._flush_lock.acquire(blocking=False):
+            return 0                                      # another flush is already running
+        try:
+            return self._flush_locked()
+        finally:
+            self._flush_lock.release()
+
+    def _flush_locked(self) -> int:
         n = 0
         for name in sorted(os.listdir(self.queue_dir)):
             if name.endswith(".meta.json"):
@@ -162,7 +178,7 @@ class Downlink:
             with open(path, "rb") as f:
                 p = Product(name, m["kind"], f.read(), m["meta"])
             burst = int(name[1:].split("_")[0]) if name.startswith("b") else 0
-            if self._send_now(p, burst):
+            if self._send_now(p, burst, requeue=False):
                 os.remove(path)
                 try:
                     os.remove(path + ".meta.json")

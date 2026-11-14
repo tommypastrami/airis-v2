@@ -1,19 +1,4 @@
-"""The only module that converts between coordinate frames.
-
-Frames (every angle in the system is in exactly one of these, in degrees):
-
-1. Sky, ICRS            ra 0..360 east-positive, dec -90..90
-2. Horizon, geographic  alt -90..90, az 0..360 from true north through east
-3. Mount, physical home el = alt + EL_OFFSET_DEG
-                        az = wrap180(az_geo - heading + MOUNT_TO_GONDOLA_AZ_DEG)
-                        both axes +/-180, no wrap-around; +el up, +az clockwise
-                        seen from above. The frame is anchored by the bridge:
-                        CAL -> MOVE HOME_*_OFFSET -> SETZERO.
-4. Firmware index frame firmware-internal; the host never sees it
-5. Encoder counts       firmware-internal
-
-The camera pixel frame is NOT assumed anywhere; detect.py gets it from a WCS.
-"""
+"""The only module that converts between coordinate frames."""
 from __future__ import annotations
 
 import math
@@ -120,12 +105,7 @@ def sun_altaz(site: Site, when: Optional[datetime] = None) -> tuple[float, float
 # ---- 2 -> 3 ------------------------------------------------------------------
 
 def altaz_to_mount(alt_deg: float, az_geo_deg: float, heading_deg: Optional[float] = None) -> MountPos:
-    """Geographic horizon -> mount physical-home frame.
-
-    ``heading_deg`` is the gondola heading (HDT, true). It is applied only when
-    HEADING_CORRECTION_ENABLED, and then it must be applied to the sun through
-    this same function, so the keep-out and the pointing share one frame.
-    """
+    """Geographic horizon -> mount physical-home frame."""
     el = alt_deg + config.EL_OFFSET_DEG
     if config.HEADING_CORRECTION_ENABLED:
         if heading_deg is None:
@@ -205,13 +185,7 @@ def path_length(pts: Sequence[MountPos]) -> float:
 
 def plan_route(start: MountPos, target: MountPos, box: Optional[SunBox],
                allow_flip: bool = True) -> list[MountPos]:
-    """Waypoints from ``start`` to ``target`` (target included) that never enter the box.
-
-    Order of preference: direct leg; one corner waypoint; two corners along one
-    edge of the box; then the same three for the flipped attitude of the target.
-    Shortest clear route wins. The firmware keeps its own box check as the last
-    line of defense.
-    """
+    """Waypoints from ``start`` to ``target`` (target included) that never enter the box."""
     if not target.in_range():
         raise Fault(Code.PTG_RANGE, f"el={target.el:.1f} az={target.az:.1f}")
     candidates = [target] + ([target.flipped()] if allow_flip and target.el >= 0 else [])
@@ -248,22 +222,28 @@ def plan_route(start: MountPos, target: MountPos, box: Optional[SunBox],
 # ---- Mount timing model -------------------------------------------------------
 
 def slew_time_s(theta_deg: float, land: bool = True) -> float:
-    """Time for the worst axis to travel ``theta_deg`` with the firmware's profile.
-
-    Quintic ramps: distance per ramp = 0.5 * Vp * Ta, Ta = 1.875 * Vp / A.
-    Calibrate against moves.csv; the bench median was 3.7 s.
-    """
+    """Time for the worst axis to travel ``theta_deg`` with the firmware's profile."""
     v, a = config.SLEW_SPEED_DPS, config.SLEW_ACCEL_DPS2
-    ta = 1.875 * v / a
-    td = 1.875 * v / (a * config.DECEL_RATIO)
-    d_ramps = 0.5 * v * (ta + td)
-    land_t = (config.LAND_ZONE_DEG / config.LAND_SPEED_DPS + 0.5) if land else 0.0
-    theta = abs(theta_deg)
-    if theta <= d_ramps:
-        # triangular profile, scale the ramps down
-        scale = math.sqrt(theta / d_ramps) if d_ramps > 0 else 0.0
-        return (ta + td) * scale + land_t + 0.2
-    return ta + td + (theta - d_ramps) / v + land_t + 0.2
+    k1 = 1.875 / a                               # ramp time per unit velocity, accel
+    k2 = 1.875 / (a * config.DECEL_RATIO)        # and decel
+    d = abs(theta_deg)
+    v_land = zone = t_land = 0.0
+    if land and d > 2.0 * config.LAND_ZONE_DEG and v > 1.5 * config.LAND_SPEED_DPS:
+        v_land, zone = config.LAND_SPEED_DPS, config.LAND_ZONE_DEG
+        t_stop = 1.875 * v_land / config.LAND_ACCEL_DPS2
+        d_stop = 0.5 * v_land * t_stop
+        if d_stop > zone:
+            t_stop, d_stop = 2.0 * zone / v_land, zone
+        t_land = (zone - d_stop) / v_land + t_stop
+    d_main = d - zone
+    d_acc = 0.5 * k1 * v * v
+    d_dec = 0.5 * k2 * (v * v - v_land * v_land)
+    if d_acc + d_dec <= d_main:                  # reaches cruise speed
+        v_peak, t_flat = v, (d_main - d_acc - d_dec) / v
+    else:                                        # short move: triangular
+        v_peak = max(v_land, math.sqrt((2.0 * d_main + k2 * v_land * v_land) / (k1 + k2)))
+        t_flat = 0.0
+    return k1 * v_peak + t_flat + k2 * (v_peak - v_land) + t_land + 0.2
 
 
 def travel_deg(a: MountPos, b: MountPos) -> float:

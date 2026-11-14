@@ -67,6 +67,8 @@ def test_target_inside_box_is_refused_with_named_code():
 
 
 def test_slew_time_model_matches_firmware_numbers():
-    assert 3.0 <= slew_time_s(90.0) <= 4.5          # firmware: ~3.6 s
-    assert 4.2 <= slew_time_s(180.0) <= 6.0         # firmware: ~4.9 s
+    # MOVE runs at the firmware's DANCE profile (50 dps, 45 dps2): worked from
+    # axisPlan() that is about 4.9 s for 90 deg and 7.0 s for 180 deg.
+    assert 4.6 <= slew_time_s(90.0) <= 5.2
+    assert 6.7 <= slew_time_s(180.0) <= 7.3
     assert slew_time_s(0.0) < slew_time_s(10.0) < slew_time_s(90.0)

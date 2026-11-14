@@ -64,13 +64,19 @@ def test_alert_miss_then_map_hit(tmp_path, fast_link):
         assert out.best_confidence >= config.CONFIDENCE_THRESHOLD
         assert orch.lock_on is not None
         kinds = [e.kind for e in sender.envelopes]
-        heads = [e.fields.get("heading") for e in sender.envelopes if e.kind == "internal_message"]
+        heads = [e.fields["detail"].replace(":", " ").split()[0] for e in sender.envelopes if e.kind == "event_notification"]
         assert "grb_confirmed" in heads and "image_manifest" in heads and "image_data" in kinds
         assert (tmp_path / "cand.csv").exists()
         # 3. a stale iteration is ignored; a lock-on keeps re-imaging the same tile
         orch.dispatch(Envelope("localization_update", {"burst_id": 42, "iteration": 0, "healpix_grid": prob.tobytes()}))
         out2 = orch.step()
         assert out2.tile.ra == out.tile.ra and out2.result == "hit"
+        # ...but only LOCK_ON_REVISITS times: then the queue resumes
+        for _ in range(config.LOCK_ON_REVISITS - 1):
+            assert orch.step().tile.ra == out.tile.ra
+        assert orch.lock_on is None
+        nxt = orch.step()
+        assert nxt is None or (nxt.tile.ra, nxt.tile.dec) != (out.tile.ra, out.tile.dec)
     finally:
         orch.shutdown(); bridge.close(); fa.shutdown()
 
@@ -126,12 +132,134 @@ def test_overheat_enters_safe_mode_until_ground_clears(tmp_path, fast_link):
 def test_comms_modes_and_pointing_cmd(tmp_path, fast_link):
     orch, bridge, fa, cam, sender = build(tmp_path, fast_link)
     try:
-        orch.dispatch(Envelope("comms_directive", {"mode": "COMMS_MODE_SLOW"}))
+        orch.dispatch(Envelope("comms_directive", {"mode": "MODE_SLOW"}))      # enum name, as ProtoCodec decodes it
         assert orch.downlink.mode == "SLOW"
+        n0 = len(fa.moves_executed)
         orch.dispatch(Envelope("pointing_cmd", {"target_elevation": 40.0, "target_azimuth": -30.0}))
-        assert fa.moves_executed[-1] == (40.0, -30.0)
-        orch.dispatch(Envelope("comms_directive", {"mode": 3}))
+        assert len(fa.moves_executed) == n0                # queued: the listener thread never slews
+        assert orch.step() is None                         # one slew, done by the acquire side
+        assert fa.moves_executed[-1] == (40.0, -30.0) and len(fa.moves_executed) == n0 + 1
+        orch.dispatch(Envelope("comms_directive", {"mode": 2}))                # MODE_STOP = 2 in the proto
         assert orch.downlink.mode == "STOP"
+        orch.dispatch(Envelope("comms_directive", {"mode": "MODE_FULL_UNSPECIFIED"}))
+        assert orch.downlink.mode == "FULL"
+        orch.dispatch(Envelope("comms_directive", {"mode": 7}))                # unknown: ignored
+        assert orch.downlink.mode == "FULL"
+    finally:
+        orch.shutdown(); bridge.close(); fa.shutdown()
+
+
+class DownMount:
+    """A mount whose bridge is unreachable, then comes back."""
+
+    def __init__(self, real):
+        self.real, self.down, self.code, self.attempts = real, True, "LNK-03", 0
+
+    def move(self, el, az):
+        self.attempts += 1
+        if self.down:
+            from airis.bridge_client import ClientResult
+            return ClientResult(False, self.code, "bridge unreachable")
+        return self.real.move(el, az)
+
+    def set_sun(self, el, az):
+        return self.real.set_sun(el, az)
+
+    def calibrate(self):
+        return self.real.calibrate()
+
+
+def test_unavailable_mount_does_not_burn_the_queue(tmp_path, fast_link):
+    """An unavailable mount is not the tile's fault: nothing is retired, and the tile is imaged once it is back."""
+    orch, bridge, fa, cam, sender = build(tmp_path, fast_link, transient=False)
+    try:
+        orch.mount = DownMount(bridge)
+        prob = gaussian_map(32, TRUE[0], TRUE[1], 6.0)[0]
+        orch.dispatch(Envelope("localization_update", {"burst_id": 5, "iteration": 1, "healpix_grid": prob.tobytes()}))
+        n_queued = len(orch.tiles)
+        first = orch.tiles.peek()
+        for code in ("LNK-03", "LNK-04", "MNT-63", "MNT-64", "MNT-65", "MNT-59"):
+            orch.mount.code = code
+            for _ in range(4):
+                out = orch.step()
+                assert out.result == "slew_retry" and out.code == code
+        assert not orch.tiles.imaged and len(orch.tiles) == n_queued
+        orch.mount.down = False
+        out = orch.step()
+        assert out.result == "miss" and (out.tile.ra, out.tile.dec) == (first.ra, first.dec)
+    finally:
+        orch.shutdown(); bridge.close(); fa.shutdown()
+
+
+def test_repeated_settle_failure_retires_the_tile_after_retries(tmp_path, fast_link):
+    orch, bridge, fa, cam, sender = build(tmp_path, fast_link, transient=False)
+    try:
+        orch.mount = DownMount(bridge)
+        orch.mount.code = "MNT-58"
+        orch.dispatch(Envelope("gcn_alert", {"burst_id": 6, "ra": TRUE[0], "dec": TRUE[1]}))
+        results = [orch.step().result for _ in range(config.SLEW_MAX_RETRIES)]
+        assert results == ["slew_retry"] * (config.SLEW_MAX_RETRIES - 1) + ["slew_failed"]
+        assert orch.step() is None
+    finally:
+        orch.shutdown(); bridge.close(); fa.shutdown()
+
+
+def test_worker_threads_survive_exceptions(tmp_path, fast_link):
+    """A camera or detector that raises must not end the science loop."""
+    orch, bridge, fa, cam, sender = build(tmp_path, fast_link, transient=False)
+    try:
+        real_capture, real_run = cam.capture, orch.detector.run
+        boom = {"capture": 2, "run": 2}
+
+        def capture(*a, **k):
+            if boom["capture"]:
+                boom["capture"] -= 1
+                raise RuntimeError("camera glitch")
+            return real_capture(*a, **k)
+
+        def run(*a, **k):
+            if boom["run"]:
+                boom["run"] -= 1
+                raise OSError("disk full")
+            return real_run(*a, **k)
+
+        cam.capture, orch.detector.run = capture, run
+        prob = gaussian_map(32, TRUE[0], TRUE[1], 6.0)[0]
+        orch.dispatch(Envelope("localization_update", {"burst_id": 9, "iteration": 1, "healpix_grid": prob.tobytes()}))
+        orch.start()
+        t0 = time.monotonic()
+        while sum(o.result == "miss" for o in orch.outcomes) < 2 and time.monotonic() - t0 < 40:
+            time.sleep(0.05)
+        assert orch.threads_alive()
+        assert sum(o.result == "miss" for o in orch.outcomes) >= 2
+        assert sum(o.result == "detect_failed" for o in orch.outcomes) == 2
+    finally:
+        orch.shutdown(); bridge.close(); fa.shutdown()
+
+
+def test_bad_map_does_not_clear_the_current_queue(tmp_path, fast_link):
+    orch, bridge, fa, cam, sender = build(tmp_path, fast_link, transient=False)
+    try:
+        prob = gaussian_map(32, TRUE[0], TRUE[1], 6.0)[0]
+        orch.dispatch(Envelope("localization_update", {"burst_id": 1, "iteration": 1, "healpix_grid": prob.tobytes()}))
+        n = len(orch.tiles)
+        orch.dispatch(Envelope("localization_update", {"burst_id": 2, "iteration": 1, "healpix_grid": bytes(256)}))
+        orch.dispatch(Envelope("localization_update", {"burst_id": 2, "iteration": 1, "healpix_grid": bytes(13)}))
+        assert orch.current_burst == 1 and len(orch.tiles) == n
+    finally:
+        orch.shutdown(); bridge.close(); fa.shutdown()
+
+
+def test_overheat_parks_once_and_tells_the_ground(tmp_path, fast_link):
+    orch, bridge, fa, cam, sender = build(tmp_path, fast_link)
+    try:
+        cam.temp_c = 75.0
+        orch.dispatch(Envelope("gcn_alert", {"burst_id": 3, "ra": TRUE[0], "dec": TRUE[1]}))
+        assert orch.step().result == "overheat"
+        assert any(e.fields.get("event_type") == "EVENT_SAFE_MODE_ENTER" for e in sender.envelopes)
+        n0 = len(fa.moves_executed)
+        assert orch.step() is None and orch.step() is None
+        assert fa.moves_executed[n0:] == [(config.SAFE_PARK_EL_DEG, config.SAFE_PARK_AZ_DEG)]
     finally:
         orch.shutdown(); bridge.close(); fa.shutdown()
 

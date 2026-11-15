@@ -182,11 +182,41 @@ class SFFTSubtractor:  # pragma: no cover - flight
         self.backend, self.device = backend, device
 
     def subtract(self, science, reference, sci_sigma, ref_sigma):
+        """File-based SFFT (Easy_CrowdedPacket) with the old flight parameters.
+
+        sci_sigma and ref_sigma are unused: SFFT fits its own kernel. The rendered reference
+        gets the dark and read noise the old code added (SExtractor inside SFFT probably needs
+        a non-zero background RMS; unverified, so the old behaviour is kept).
+        """
+        import tempfile
+        from astropy.io import fits
         try:
-            from sfft.EasyCrowdedPacket import Easy_CrowdedPacket  # noqa: F401
-        except ImportError as e:
-            raise Fault(Code.DET_SUBTRACTION, f"sfft not available: {e}")
-        raise Fault(Code.DET_SUBTRACTION, "SFFT file-based call not wired in this build; use MatchedGaussianSubtractor")
+            from sfft.EasyCrowdedPacket import Easy_CrowdedPacket
+            sci = np.asarray(science, dtype=np.float32)
+            rng = np.random.default_rng(0)
+            ref = (np.asarray(reference, dtype=float) + rng.poisson(0.56 * 9 * 10, reference.shape)
+                   + rng.normal(1, 1.5, reference.shape).astype(int))
+            ref = np.clip(ref, 0, config.SFFT_SATURATE).astype(np.float32)
+            with tempfile.TemporaryDirectory() as d:
+                sci_path, ref_path, diff_path = (os.path.join(d, n) for n in ("sci.fits", "ref.fits", "diff.fits"))
+                for arr, path in ((sci, sci_path), (ref, ref_path)):
+                    hdu = fits.PrimaryHDU(arr)
+                    hdu.header["SATURATE"] = config.SFFT_SATURATE
+                    hdu.header["GAIN"] = config.SFFT_GAIN
+                    hdu.writeto(path)
+                Easy_CrowdedPacket.ECP(FITS_REF=ref_path, FITS_SCI=sci_path, FITS_DIFF=diff_path, FITS_Solution=None,
+                    ForceConv='AUTO', GKerHW=None, KerHWRatio=2.0, KerHWLimit=(2, 15), KerPolyOrder=2,
+                    BGPolyOrder=2, ConstPhotRatio=True, MaskSatContam=False, GAIN_KEY='GAIN',
+                    SATUR_KEY='SATURATE', BACK_TYPE='AUTO', BACK_VALUE=0.0, BACK_SIZE=64, BACK_FILTERSIZE=3,
+                    DETECT_THRESH=5.0, DETECT_MINAREA=5, DETECT_MAXAREA=0, DEBLEND_MINCONT=0.005, BACKPHOTO_TYPE='LOCAL',
+                    ONLY_FLAGS=None, BoundarySIZE=0.0, BACK_SIZE_SUPER=128, StarExt_iter=2, PriorBanMask=None,
+                    BACKEND_4SUBTRACT=self.backend, CUDA_DEVICE_4SUBTRACT=self.device, VERBOSE_LEVEL=2)
+                diff = np.nan_to_num(np.asarray(fits.getdata(diff_path), dtype=float))
+            if diff.shape != science.shape:
+                raise ValueError(f"difference image shape {diff.shape} != science {science.shape}")
+            return diff
+        except Exception as e:
+            raise Fault(Code.DET_SUBTRACTION, f"SFFT subtraction failed: {e}")
 
 
 # ---- Candidates -------------------------------------------------------------------

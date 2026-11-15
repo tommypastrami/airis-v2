@@ -78,3 +78,46 @@ def test_faint_transient_detection_curve():
             n += int(Pipeline(csv_path=None).run(a, SKY.catalog(SKY.ra0, SKY.dec0), second=b).transient_found)
         found[flux] = n / 4
     assert found[8000.0] == 1.0 and found[8000.0] >= found[2500.0] >= found[800.0]
+
+
+def test_sfft_subtractor_round_trips_through_fits(monkeypatch):
+    """A fake sfft.EasyCrowdedPacket whose ECP writes sci - ref: shape and finiteness hold, old parameters are passed, a failing ECP is DET-02."""
+    import sys
+    import types
+    from astropy.io import fits
+    from airis.detect import SFFTSubtractor
+
+    calls, fail = [], []
+
+    class FakeECP:
+        @staticmethod
+        def ECP(**kw):
+            calls.append(kw)
+            if fail:
+                raise RuntimeError("no CUDA device")
+            sci, ref = fits.getdata(kw["FITS_SCI"]), fits.getdata(kw["FITS_REF"])
+            assert fits.getheader(kw["FITS_REF"])["SATURATE"] == config.SFFT_SATURATE
+            assert fits.getheader(kw["FITS_SCI"])["GAIN"] == config.SFFT_GAIN
+            diff = (sci - ref).astype(np.float32)
+            diff[0, 0] = np.nan                                      # SFFT leaves NaN where it masks
+            fits.PrimaryHDU(diff).writeto(kw["FITS_DIFF"])
+
+    pkg, mod = types.ModuleType("sfft"), types.ModuleType("sfft.EasyCrowdedPacket")
+    mod.Easy_CrowdedPacket = FakeECP
+    monkeypatch.setitem(sys.modules, "sfft", pkg)
+    monkeypatch.setitem(sys.modules, "sfft.EasyCrowdedPacket", mod)
+
+    rng = np.random.default_rng(1)
+    sci, ref = rng.normal(100.0, 3.0, (48, 64)), rng.normal(100.0, 3.0, (48, 64))
+    diff = SFFTSubtractor().subtract(sci, ref, 1.2, 1.2)
+    assert diff.shape == sci.shape and diff.dtype == float and np.isfinite(diff).all()
+    assert diff[0, 0] == 0.0
+    kw = calls[0]
+    assert kw["KerPolyOrder"] == 2 and kw["KerHWLimit"] == (2, 15) and kw["BACKEND_4SUBTRACT"] == "Cupy"
+    assert kw["SATUR_KEY"] == "SATURATE" and kw["GAIN_KEY"] == "GAIN" and kw["CUDA_DEVICE_4SUBTRACT"] == 0
+    assert 40.0 < np.mean((sci - ref) - diff) < 60.0                   # the reference carried the old dark + read noise
+
+    fail.append(True)
+    with pytest.raises(Fault) as e:
+        SFFTSubtractor().subtract(sci, ref, 1.2, 1.2)
+    assert e.value.code == Code.DET_SUBTRACTION and "no CUDA device" in str(e.value)

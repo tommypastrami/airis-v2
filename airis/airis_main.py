@@ -451,6 +451,9 @@ def main() -> None:  # pragma: no cover - flight entry point
     from . import nav as nav_mod
     from .adapt_link import JsonCodec, Listener, ProtoCodec, UdpSender, run_udp_envelope_listener
     from .bridge_client import MountClient
+    from .camera import XimeaCamera
+    from .catalog import GaiaCatalog
+    from .detect import SFFTSubtractor
     from .payload_hw import ThermalWatchdog
     p = argparse.ArgumentParser(description="AIRIS orchestrator v2")
     p.add_argument("--codec", choices=["json", "proto"], default="proto")
@@ -459,8 +462,11 @@ def main() -> None:  # pragma: no cover - flight entry point
     codec = JsonCodec() if a.codec == "json" else ProtoCodec()
     sender = UdpSender(codec)                 # downlink goes through the airis-comms server (UDP 9003)
     nav = NavState()
-    import airis_photo_capture as camera_mod  # the camera module must provide capture()/temperature_c()
-    orch = Orchestrator(MountClient(), camera_mod, camera_mod.catalog, Pipeline(), Downlink(sender), sender, nav)
+    camera = XimeaCamera()
+    gaia = GaiaCatalog(config.GAIA_CHUNK_DIR)
+    log.warning("%s no registrar is configured: every frame will report DET-01 until plate solving exists",
+                Code.DET_REGISTRATION.value)
+    orch = Orchestrator(MountClient(), camera, gaia.stars, Pipeline(subtractor=SFFTSubtractor()), Downlink(sender), sender, nav)
 
     # Direct from ADAPT (framed TCP): alerts, maps, comms directives, navigation.
     Listener(config.ADAPT_PORT_CMD, codec, orch.dispatch, timeout_s=config.ADAPT_RECV_TIMEOUT_CMD_S,
@@ -472,7 +478,7 @@ def main() -> None:  # pragma: no cover - flight entry point
                      daemon=True, name="comms-commands").start()
     threading.Thread(target=nav_mod.run_udp_listener, args=(nav,), daemon=True, name="trimble").start()
 
-    watchdog = ThermalWatchdog(read_camera=camera_mod.temperature_c, flight_phase=nav.flight_phase,
+    watchdog = ThermalWatchdog(read_camera=camera.temperature_c, flight_phase=nav.flight_phase,
                                shutdown=lambda: orch.enter_safe_mode("Jetson over the thermal limit"))
     log.warning("thermal watchdog running WITHOUT the sensor RTD and heater output (not wired in main())")
     threading.Thread(target=watchdog.run, args=(orch.stop,), daemon=True, name="thermal").start()

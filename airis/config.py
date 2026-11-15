@@ -88,7 +88,7 @@ NAV_PUSH_MIN_PERIOD_S = 5.0
 ACCEPTED_GGA_QUALITIES = {1, 2, 4, 5}
 
 # ---- Orchestrator ------------------------------------------------------------
-OVERHEAT_C = 60.0              # camera sensor temperature that enters safe mode
+OVERHEAT_C = 51.0              # camera sensor temperature that enters safe mode
 SLEW_RETRY_BACKOFF_S = 5.0     # wait after a failed slew before trying again
 SLEW_MAX_RETRIES = 3           # tile-specific failures (e.g. settle) before the tile is retired
 LOCK_ON_REVISITS = 3           # PLACEHOLDER: times a hit tile is re-imaged before the queue resumes
@@ -104,6 +104,22 @@ HEALPIX_NESTED = False
 SCHED_CANDIDATE_PIXELS = 600   # top-N pixels tried as FOV centers
 EXPOSURE_S = 8.0
 PROC_S = 4.0
+
+# ---- Camera (XIMEA; replaces vars.yaml) --------------------------------------
+CAM_BINNING = "XI_DWN_3x3"
+CAM_IMG_FORMAT = "XI_MONO16"
+CAM_SENSOR_BIT_DEPTH = "XI_BPP_12"
+CAM_OUTPUT_BIT_DEPTH = "XI_BPP_16"
+CAM_IMAGE_BIT_DEPTH = "XI_BPP_16"
+CAM_GAIN_DB = 6
+CAM_FLAT_FILE = None           # flat-field correction is OFF until both files are set
+CAM_DARK_FILE = None
+
+# ---- Reference catalog and SFFT ----------------------------------------------
+GAIA_CHUNK_DIR = "/home/wusat/airis/airis_gaia_chunks"
+GAIA_ZERO_POINT = 18.0
+SFFT_SATURATE = 51000          # old value; 12-bit summed 3x3 would top out at 36855 - bench-check
+SFFT_GAIN = 0                  # old value, copied as is
 
 # ---- Detection ---------------------------------------------------------------
 PSF_SIGMA_PX = 1.2

@@ -8,4 +8,7 @@ pyserial
 Pillow
 protobuf        # plus the generated ADAPT bindings on PYTHONPATH (see README)
 spidev          # Jetson only: MAX31865 RTD
+sfft            # Jetson only: SFFT image subtraction. Needs scikit-image 0.18.3, hence numpy < 2 (1.26.4 was used)
+cupy            # Jetson only: GPU backend for sfft; match the JetPack CUDA version
+# ximea         # Jetson only: XIMEA xiAPI Python package, from the vendor installer (not on PyPI)
 pytest          # tests only
